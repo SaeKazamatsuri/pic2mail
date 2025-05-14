@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:archive/archive_io.dart';
@@ -11,10 +12,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+// 定数の定義
 const String KEY_SENDER_NAME = "senderName";
-const String KEY_RECIPIENT = "recipient";
 const String KEY_SUBJECT = "subject";
 const String KEY_BODY = "body";
+const String KEY_RECIPIENT_LIST = "recipientList";
 
 void main() {
   runApp(MyApp());
@@ -49,6 +51,8 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
   List<File> _selectedImages = [];
   bool _isSending = false;
   final ValueNotifier<String> _progressMessageNotifier = ValueNotifier<String>("");
+  // フラグで進捗ダイアログの表示状態を管理（多重展開を防止）
+  bool _isDialogShowing = false;
 
   @override
   void dispose() {
@@ -56,6 +60,7 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
     super.dispose();
   }
 
+  // 画像選択（複数画像対応）
   Future<void> _pickImages() async {
     final List<XFile>? pickedFiles = await _picker.pickMultiImage();
     if (pickedFiles != null) {
@@ -65,6 +70,7 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
     }
   }
 
+  // 画像圧縮処理
   Future<File> _compressImage(File file) async {
     final tempDir = await getTemporaryDirectory();
     final targetPath = '${tempDir.path}/${DateTime.now().millisecondsSinceEpoch}.jpg';
@@ -77,10 +83,75 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
     return await File(targetPath).writeAsBytes(result);
   }
 
+  // 送信先選択ダイアログの表示
+  Future<List<Map<String, String>>?> _selectRecipients(List<Map<String, String>> allRecipients) async {
+    List<bool> selected = List<bool>.filled(allRecipients.length, false);
+    return await showDialog<List<Map<String, String>>>(
+      context: context,
+      barrierDismissible: true, // ダイアログ外タップで閉じる設定
+      builder: (context) {
+        return AlertDialog(
+          title: Text("送信先を選択してください"),
+          content: StatefulBuilder(
+            builder: (context, setState) {
+              return Container(
+                width: double.maxFinite,
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: allRecipients.length,
+                  itemBuilder: (context, index) {
+                    final recipient = allRecipients[index];
+                    return CheckboxListTile(
+                      title: Text(
+                        "${recipient['label']}",
+                        style: TextStyle(fontSize: 18),
+                      ),
+                      value: selected[index],
+                      onChanged: (bool? value) {
+                        setState(() {
+                          selected[index] = value ?? false;
+                        });
+                      },
+                    );
+                  },
+                ),
+              );
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context, null); // キャンセル時は null を返す
+              },
+              child: Text("キャンセル"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                List<Map<String, String>> chosen = [];
+                for (int i = 0; i < allRecipients.length; i++) {
+                  if (selected[i]) {
+                    chosen.add(allRecipients[i]);
+                  }
+                }
+                Navigator.pop(context, chosen);
+              },
+              child: Text("決定"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 進捗ダイアログの表示
   void _showProgressDialog() {
+    // 既にダイアログが表示されている場合は新たに表示しない
+    if (_isDialogShowing) return;
+
+    _isDialogShowing = true;
     showDialog(
       context: context,
-      barrierDismissible: false,
+      barrierDismissible: false, // ユーザーが外側をタップしても閉じない
       builder: (_) {
         return ValueListenableBuilder<String>(
           valueListenable: _progressMessageNotifier,
@@ -102,21 +173,36 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
           },
         );
       },
-    );
+    ).then((_) {
+      // ダイアログが閉じられた後にフラグを更新
+      _isDialogShowing = false;
+    });
   }
 
+  // 進捗ダイアログの非表示処理
+  void _hideProgressDialog() {
+    if (_isDialogShowing) {
+      Navigator.of(context, rootNavigator: true).pop();
+      _isDialogShowing = false;
+    }
+  }
+
+  // メール送信処理（非同期で実行）
   Future<void> _sendEmail() async {
     if (_selectedImages.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('画像が選択されていません')));
       return;
     }
     if (_isSending) return;
-    setState(() { _isSending = true; });
+    setState(() {
+      _isSending = true;
+    });
 
     _progressMessageNotifier.value = "処理を開始します...";
     _showProgressDialog();
 
     try {
+      // 画像の圧縮処理
       _progressMessageNotifier.value = "画像を圧縮中...";
       List<File> compressedFiles = [];
       for (File file in _selectedImages) {
@@ -124,6 +210,7 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
         compressedFiles.add(compressed);
       }
 
+      // ZIPファイルの作成
       _progressMessageNotifier.value = "ZIPファイルを作成中...";
       final archive = Archive();
       for (File file in compressedFiles) {
@@ -132,52 +219,98 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
         archive.addFile(ArchiveFile(fileName, fileBytes.length, fileBytes));
       }
       List<int>? zipData = ZipEncoder().encode(archive);
-      if (zipData == false) throw Exception("ZIPエンコードに失敗しました");
+      if (zipData == null) throw Exception("ZIPエンコードに失敗しました");
       final tempDir = await getTemporaryDirectory();
       final formattedDate = DateFormat('yyMMdd').format(DateTime.now());
       final zipPath = '${tempDir.path}/images_$formattedDate.zip';
       File zipFile = File(zipPath);
       await zipFile.writeAsBytes(zipData);
 
+      // ZIPファイルサイズのチェック
       _progressMessageNotifier.value = "ZIPファイルサイズをチェック中...";
       int zipFileSize = await zipFile.length();
       const int maxAttachmentSize = 25 * 1024 * 1024;
       if (zipFileSize > maxAttachmentSize) {
-        Navigator.of(context).pop();
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('添付ファイルのサイズが25MBを超えています')));
-        setState(() { _isSending = false; });
+        _hideProgressDialog(); // 既存の進捗ダイアログを閉じる
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('添付ファイルのサイズが25MBを超えています')));
+        setState(() {
+          _isSending = false;
+        });
         return;
       }
 
+      // 保存済みの送信先リストの取得
+      final prefs = await SharedPreferences.getInstance();
+      String? recipientListJson = prefs.getString(KEY_RECIPIENT_LIST);
+      if (recipientListJson == null) {
+        _hideProgressDialog(); // ダイアログを閉じる
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('送信先が設定されていません')));
+        setState(() {
+          _isSending = false;
+        });
+        return;
+      }
+      List<dynamic> jsonList = jsonDecode(recipientListJson);
+      List<Map<String, String>> allRecipients = jsonList.map<Map<String, String>>((item) {
+        return {
+          'label': item['label'] as String,
+          'email': item['email'] as String,
+        };
+      }).toList();
+
+      // 進捗ダイアログを一度非表示にする（送信先選択前）
+      _hideProgressDialog();
+
+      // 送信先選択ダイアログの表示
+      List<Map<String, String>>? selectedRecipients = await _selectRecipients(allRecipients);
+      if (selectedRecipients == null || selectedRecipients.isEmpty) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('送信先が選択されませんでした')));
+        setState(() {
+          _isSending = false;
+        });
+        return;
+      }
+
+      // メール送信処理前に再び進捗ダイアログを表示
       _progressMessageNotifier.value = "メール送信中...";
-      String username = '';
-      String password = '';
+      _showProgressDialog();
+
+      String username = 'norimasa.hiratsuka@gmail.com'; // Gmailのユーザー名（メールアドレス）
+      String password = 'fghmyxdwzvfdjxyl'; // Gmailのパスワードまたはアプリパスワード
       final smtpServer = gmail(username, password);
 
-      // 設定値を読み込み
-      final prefs = await SharedPreferences.getInstance();
+      // その他設定値の読み込み
       final senderName = prefs.getString(KEY_SENDER_NAME) ?? "";
-      final recipient = prefs.getString(KEY_RECIPIENT) ?? "";
       final subject = prefs.getString(KEY_SUBJECT) ?? "選択した画像（ZIPファイル添付）";
       final body = prefs.getString(KEY_BODY) ?? "画像をZIPファイルに圧縮して添付しています。";
 
       final message = Message()
         ..from = Address(username, senderName)
-        ..recipients.add(recipient)
+        // 複数の送信先メールアドレスを追加
+        ..recipients.addAll(selectedRecipients.map((e) => e['email']!).toList())
         ..subject = subject
         ..text = body
         ..attachments.add(FileAttachment(zipFile));
 
       final sendReport = await send(message, smtpServer);
       print('メッセージ送信完了: ' + sendReport.toString());
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('メールを送信しました')));
-      setState(() { _selectedImages = []; });
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('メールを送信しました')));
+      setState(() {
+        _selectedImages = [];
+      });
     } catch (error) {
       print('メール送信エラー: $error');
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('メール送信に失敗しました')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('メール送信に失敗しました')));
     } finally {
-      Navigator.of(context).pop();
-      setState(() { _isSending = false; });
+      _hideProgressDialog(); // メール送信完了後に必ず進捗ダイアログを閉じる
+      setState(() {
+        _isSending = false;
+      });
     }
   }
 
@@ -247,9 +380,10 @@ class EmailSettingsScreen extends StatefulWidget {
 
 class _EmailSettingsScreenState extends State<EmailSettingsScreen> {
   final _senderController = TextEditingController();
-  final _recipientController = TextEditingController();
   final _subjectController = TextEditingController();
   final _bodyController = TextEditingController();
+  // 送信先リスト：各要素は {'label': String, 'email': String} の形
+  List<Map<String, String>> _recipients = [];
 
   @override
   void initState() {
@@ -257,22 +391,97 @@ class _EmailSettingsScreenState extends State<EmailSettingsScreen> {
     _loadSettings();
   }
 
+  // 設定値の読み込み（送信者情報・件名・本文および送信先リスト）
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     _senderController.text = prefs.getString(KEY_SENDER_NAME) ?? "";
-    _recipientController.text = prefs.getString(KEY_RECIPIENT) ?? "";
     _subjectController.text = prefs.getString(KEY_SUBJECT) ?? "ファイル添付";
     _bodyController.text = prefs.getString(KEY_BODY) ?? "画像をZIPファイルに圧縮して添付しています。";
+    String? recipientListJson = prefs.getString(KEY_RECIPIENT_LIST);
+    if (recipientListJson != null) {
+      List<dynamic> jsonList = jsonDecode(recipientListJson);
+      _recipients = jsonList.map<Map<String, String>>((item) {
+        return {
+          'label': item['label'] as String,
+          'email': item['email'] as String,
+        };
+      }).toList();
+    }
     setState(() {});
   }
 
+  // 送信先リストの保存
+  Future<void> _saveRecipientList() async {
+    final prefs = await SharedPreferences.getInstance();
+    String encoded = jsonEncode(_recipients);
+    await prefs.setString(KEY_RECIPIENT_LIST, encoded);
+  }
+
+  // 全設定値（送信者情報・件名・本文および送信先リスト）の保存
   Future<void> _saveSettings() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(KEY_SENDER_NAME, _senderController.text);
-    await prefs.setString(KEY_RECIPIENT, _recipientController.text);
     await prefs.setString(KEY_SUBJECT, _subjectController.text);
     await prefs.setString(KEY_BODY, _bodyController.text);
+    await _saveRecipientList();
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("設定を保存しました")));
+  }
+
+  // 送信先追加のためのダイアログ表示
+  Future<void> _showAddRecipientDialog() async {
+    String label = "";
+    String email = "";
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("送信先を追加"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                decoration: InputDecoration(labelText: "ラベル"),
+                onChanged: (value) {
+                  label = value;
+                },
+              ),
+              TextField(
+                decoration: InputDecoration(labelText: "メールアドレス"),
+                onChanged: (value) {
+                  email = value;
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              child: Text("キャンセル"),
+              onPressed: () {
+                Navigator.pop(context);
+              },
+            ),
+            ElevatedButton(
+              child: Text("追加"),
+              onPressed: () {
+                if (label.isNotEmpty && email.isNotEmpty) {
+                  setState(() {
+                    _recipients.add({'label': label, 'email': email});
+                  });
+                  Navigator.pop(context);
+                }
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 送信先リスト項目の削除処理
+  void _deleteRecipient(int index) {
+    setState(() {
+      _recipients.removeAt(index);
+    });
   }
 
   @override
@@ -288,9 +497,28 @@ class _EmailSettingsScreenState extends State<EmailSettingsScreen> {
               decoration: InputDecoration(labelText: "送信者名"),
             ),
             SizedBox(height: 16),
-            TextField(
-              controller: _recipientController,
-              decoration: InputDecoration(labelText: "送信先"),
+            Text("送信先一覧",
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            // 送信先リストの表示
+            ListView.builder(
+              shrinkWrap: true,
+              physics: NeverScrollableScrollPhysics(),
+              itemCount: _recipients.length,
+              itemBuilder: (context, index) {
+                final recipient = _recipients[index];
+                return ListTile(
+                  title: Text("${recipient['label']} (${recipient['email']})"),
+                  trailing: IconButton(
+                    icon: Icon(Icons.delete),
+                    onPressed: () => _deleteRecipient(index),
+                  ),
+                );
+              },
+            ),
+            SizedBox(height: 8),
+            ElevatedButton(
+              onPressed: _showAddRecipientDialog,
+              child: Text("送信先を追加"),
             ),
             SizedBox(height: 16),
             TextField(
