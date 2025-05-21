@@ -278,8 +278,8 @@ class _ImagePickerScreenState extends State<ImagePickerScreen> {
       _progressMessageNotifier.value = "メール送信中...";
       _showProgressDialog();
 
-      String username = 'norimasa.hiratsuka@gmail.com'; // Gmailのユーザー名（メールアドレス）
-      String password = 'fghmyxdwzvfdjxyl'; // Gmailのパスワードまたはアプリパスワード
+      String username = ''; // Gmailのユーザー名（メールアドレス）
+      String password = ''; // Gmailのパスワードまたはアプリパスワード
       final smtpServer = gmail(username, password);
 
       // その他設定値の読み込み
